@@ -1256,8 +1256,10 @@ spv::StorageClass TGlslangToSpvTraverser::TranslateStorageClass(const glslang::T
     if (type.getBasicType() == glslang::EbtRayQuery)
         return spv::StorageClassPrivate;
 #ifndef GLSLANG_WEB
-    if (type.getQualifier().isSpirvByReference())
-        return spv::StorageClassFunction;
+    if (type.getQualifier().isSpirvByReference()) {
+        if (type.getQualifier().isParamInput() || type.getQualifier().isParamOutput())
+            return spv::StorageClassFunction;
+    }
 #endif
     if (type.getQualifier().isPipeInput())
         return spv::StorageClassInput;
@@ -1830,10 +1832,10 @@ TGlslangToSpvTraverser::TGlslangToSpvTraverser(unsigned int spvVersion,
             std::vector<spv::Id> operandIds;
             assert(!modeId.second.empty());
             for (auto extraOperand : modeId.second) {
-                int nextConst = 0;
-                spv::Id operandId = createSpvConstantFromConstUnionArray(
-                    extraOperand->getType(), extraOperand->getConstArray(), nextConst, false);
-                operandIds.push_back(operandId);
+                if (extraOperand->getType().getQualifier().isSpecConstant())
+                    operandIds.push_back(getSymbolId(extraOperand->getAsSymbolNode()));
+                else
+                    operandIds.push_back(createSpvConstant(*extraOperand));
             }
             builder.addExecutionModeId(shaderEntry, static_cast<spv::ExecutionMode>(modeId.first), operandIds);
         }
@@ -4148,68 +4150,55 @@ spv::Id TGlslangToSpvTraverser::convertGlslangToSpvType(const glslang::TType& ty
         const auto& spirvType = type.getSpirvType();
         const auto& spirvInst = spirvType.spirvInst;
 
-        std::vector<spv::Id> operands;
+        std::vector<spv::IdImmediate> operands;
         for (const auto& typeParam : spirvType.typeParams) {
-            if (typeParam.isConstant) {
-                // Constant expression
-                if (typeParam.constant->isLiteral()) {
-                    if (typeParam.constant->getBasicType() == glslang::EbtFloat) {
-                        float floatValue = static_cast<float>(typeParam.constant->getConstArray()[0].getDConst());
-                        unsigned literal = *reinterpret_cast<unsigned*>(&floatValue);
-                        operands.push_back(literal);
-                    } else if (typeParam.constant->getBasicType() == glslang::EbtInt) {
-                        unsigned literal = typeParam.constant->getConstArray()[0].getIConst();
-                        operands.push_back(literal);
-                    } else if (typeParam.constant->getBasicType() == glslang::EbtUint) {
-                        unsigned literal = typeParam.constant->getConstArray()[0].getUConst();
-                        operands.push_back(literal);
-                    } else if (typeParam.constant->getBasicType() == glslang::EbtBool) {
-                        unsigned literal = typeParam.constant->getConstArray()[0].getBConst();
-                        operands.push_back(literal);
-                    } else if (typeParam.constant->getBasicType() == glslang::EbtString) {
-                        auto str = typeParam.constant->getConstArray()[0].getSConst()->c_str();
-                        unsigned literal = 0;
-                        char* literalPtr = reinterpret_cast<char*>(&literal);
-                        unsigned charCount = 0;
-                        char ch = 0;
-                        do {
-                            ch = *(str++);
-                            *(literalPtr++) = ch;
-                            ++charCount;
-                            if (charCount == 4) {
-                                operands.push_back(literal);
-                                literalPtr = reinterpret_cast<char*>(&literal);
-                                charCount = 0;
-                            }
-                        } while (ch != 0);
-
-                        // Partial literal is padded with 0
-                        if (charCount > 0) {
-                            for (; charCount < 4; ++charCount)
-                                *(literalPtr++) = 0;
-                            operands.push_back(literal);
+            // Constant expression
+            if (typeParam.constant->isLiteral()) {
+                if (typeParam.constant->getBasicType() == glslang::EbtFloat) {
+                    float floatValue = static_cast<float>(typeParam.constant->getConstArray()[0].getDConst());
+                    unsigned literal = *reinterpret_cast<unsigned*>(&floatValue);
+                    operands.push_back({false, literal});
+                } else if (typeParam.constant->getBasicType() == glslang::EbtInt) {
+                    unsigned literal = typeParam.constant->getConstArray()[0].getIConst();
+                    operands.push_back({false, literal});
+                } else if (typeParam.constant->getBasicType() == glslang::EbtUint) {
+                    unsigned literal = typeParam.constant->getConstArray()[0].getUConst();
+                    operands.push_back({false, literal});
+                } else if (typeParam.constant->getBasicType() == glslang::EbtBool) {
+                    unsigned literal = typeParam.constant->getConstArray()[0].getBConst();
+                    operands.push_back({false, literal});
+                } else if (typeParam.constant->getBasicType() == glslang::EbtString) {
+                    auto str = typeParam.constant->getConstArray()[0].getSConst()->c_str();
+                    unsigned literal = 0;
+                    char* literalPtr = reinterpret_cast<char*>(&literal);
+                    unsigned charCount = 0;
+                    char ch = 0;
+                    do {
+                        ch = *(str++);
+                        *(literalPtr++) = ch;
+                        ++charCount;
+                        if (charCount == 4) {
+                            operands.push_back({false, literal});
+                            literalPtr = reinterpret_cast<char*>(&literal);
+                            charCount = 0;
                         }
-                    } else
-                        assert(0); // Unexpected type
-                } else {
-                    int nextConst = 0;
-                    spv::Id constant = createSpvConstantFromConstUnionArray(
-                        typeParam.constant->getType(), typeParam.constant->getConstArray(), nextConst, false);
-                    operands.push_back(constant);
-                }
-            } else {
-                // Type specifier
-                spv::Id typeId = convertGlslangToSpvType(*typeParam.type);
-                operands.push_back(typeId);
-            }
+                    } while (ch != 0);
+
+                    // Partial literal is padded with 0
+                    if (charCount > 0) {
+                        for (; charCount < 4; ++charCount)
+                            *(literalPtr++) = 0;
+                        operands.push_back({false, literal});
+                    }
+                } else
+                    assert(0); // Unexpected type
+            } else
+                operands.push_back({true, createSpvConstant(*typeParam.constant)});
         }
 
-        if (spirvInst.set == "")
-            spvType = builder.createOp(static_cast<spv::Op>(spirvInst.id), spv::NoType, operands);
-        else {
-            spvType = builder.createBuiltinCall(
-                spv::NoType, getExtBuiltins(spirvInst.set.c_str()), spirvInst.id, operands);
-        }
+        assert(spirvInst.set == ""); // Currently, couldn't be extended instructions.
+        spvType = builder.makeGenericType(static_cast<spv::Op>(spirvInst.id), operands);
+
         break;
     }
 #endif
@@ -8847,12 +8836,12 @@ spv::Id TGlslangToSpvTraverser::getSymbolId(const glslang::TIntermSymbol* symbol
             std::vector<spv::Id> operandIds;
             assert(!decorateId.second.empty());
             for (auto extraOperand : decorateId.second) {
-                int nextConst = 0;
-                spv::Id operandId = createSpvConstantFromConstUnionArray(
-                    extraOperand->getType(), extraOperand->getConstArray(), nextConst, false);
-                operandIds.push_back(operandId);
+                if (extraOperand->getQualifier().isSpecConstant())
+                    operandIds.push_back(getSymbolId(extraOperand->getAsSymbolNode()));
+                else
+                    operandIds.push_back(createSpvConstant(*extraOperand));
             }
-            builder.addDecoration(id, static_cast<spv::Decoration>(decorateId.first), operandIds);
+            builder.addDecorationId(id, static_cast<spv::Decoration>(decorateId.first), operandIds);
         }
 
         // Add spirv_decorate_string
